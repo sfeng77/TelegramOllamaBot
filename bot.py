@@ -3,8 +3,8 @@ import json
 import logging
 import aiohttp
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 # 配置日志
 logging.basicConfig(
@@ -18,18 +18,36 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
 
+# 可用的模型列表
+AVAILABLE_MODELS = {
+    'deepseek_small': 'deepseek-r1:1.5b',
+    'deepseek_large': 'deepseek-r1:32b',
+    'llama2': 'llama2',
+    'llama2-uncensored': 'llama2-uncensored',
+    'mistral': 'mistral',
+    'neural-chat': 'neural-chat'
+}
+
+# 默认模型
+DEFAULT_MODEL = 'deepseek_large'
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理 /start 命令"""
+    # 初始化用户设置
+    if not context.user_data.get('model'):
+        context.user_data['model'] = DEFAULT_MODEL
+
     welcome_message = """
 欢迎使用 AI 聊天机器人！
 
-这个机器人使用 deepseek-r1:32b 模型来回答您的问题。
-直接发送消息即可开始对话。
+这个机器人使用 Ollama 来回答您的问题。
+当前使用的模型是：{}
 
 命令列表：
 /start - 显示此帮助信息
 /help - 获取帮助
-"""
+/model - 选择 AI 模型
+""".format(AVAILABLE_MODELS[context.user_data['model']])
     await update.message.reply_text(welcome_message)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -38,20 +56,47 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 使用说明：
 
 1. 直接发送文字消息即可与 AI 对话
-2. AI 会记住对话上下文
-3. 如果遇到问题，请尝试重新发送消息
-4. 如需重新开始对话，请使用 /start 命令
-"""
+2. 使用 /model 命令可以切换不同的 AI 模型
+3. 当前支持的模型：
+{}
+4. 如果遇到问题，请尝试重新发送消息
+5. 如需重新开始对话，请使用 /start 命令
+""".format('\n'.join(f'   - {name}: {model}' for name, model in AVAILABLE_MODELS.items()))
     await update.message.reply_text(help_text)
 
-async def query_ollama(prompt: str) -> str:
+async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """处理 /model 命令"""
+    keyboard = []
+    # 创建模型选择按钮
+    for name, model in AVAILABLE_MODELS.items():
+        # 在当前选中的模型旁边添加标记
+        current = '✓ ' if context.user_data.get('model') == name else ''
+        keyboard.append([InlineKeyboardButton(f"{current}{model}", callback_data=f"model_{name}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text('请选择要使用的 AI 模型：', reply_markup=reply_markup)
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """处理按钮回调"""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data.startswith('model_'):
+        model_name = query.data[6:]  # 移除 'model_' 前缀
+        if model_name in AVAILABLE_MODELS:
+            context.user_data['model'] = model_name
+            await query.edit_message_text(f'已切换到模型：{AVAILABLE_MODELS[model_name]}')
+        else:
+            await query.edit_message_text('无效的模型选择')
+
+async def query_ollama(prompt: str, model: str) -> str:
     """向 Ollama API 发送请求"""
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(
                 OLLAMA_API_URL,
                 json={
-                    "model": "deepseek-r1:32b",
+                    "model": model,
                     "prompt": prompt,
                     "stream": False
                 }
@@ -69,12 +114,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """处理用户消息"""
     user_message = update.message.text
     
+    # 确保用户有选择的模型，如果没有则使用默认模型
+    if not context.user_data.get('model'):
+        context.user_data['model'] = DEFAULT_MODEL
+    
+    current_model = AVAILABLE_MODELS[context.user_data['model']]
+    
     # 发送"正在思考"消息
-    thinking_message = await update.message.reply_text("正在思考...")
+    thinking_message = await update.message.reply_text(
+        f"正在思考...\n使用模型：{current_model}"
+    )
     
     try:
         # 获取 AI 回复
-        ai_response = await query_ollama(user_message)
+        ai_response = await query_ollama(user_message, current_model)
         
         # 删除"正在思考"消息
         await thinking_message.delete()
@@ -97,6 +150,8 @@ def main() -> None:
     # 添加处理器
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("model", model_command))
+    application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # 启动机器人
