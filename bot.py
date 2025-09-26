@@ -1,50 +1,53 @@
-import os
-import json
+import asyncio
 import logging
+import logging.handlers
+import os
 import time
+from pathlib import Path
+
 import aiohttp
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-# 配置日志
-import logging.handlers
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# 创建日志目录
-import os
-log_dir = "logs"
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir)
-
-# 配置根日志器
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.StreamHandler(),  # 控制台输出
+        logging.StreamHandler(),
         logging.handlers.RotatingFileHandler(
-            os.path.join(log_dir, 'bot.log'),
-            maxBytes=10*1024*1024,  # 10MB
+            LOG_DIR / "bot.log",
+            maxBytes=10 * 1024 * 1024,
             backupCount=5,
-            encoding='utf-8'
-        )
-    ]
+            encoding="utf-8",
+        ),
+    ],
 )
 
-# 创建专门的对话日志器
-conversation_logger = logging.getLogger('conversation')
+conversation_logger = logging.getLogger("conversation")
 conversation_handler = logging.handlers.RotatingFileHandler(
-    os.path.join(log_dir, 'conversations.log'),
-    maxBytes=10*1024*1024,  # 10MB
+    LOG_DIR / "conversations.log",
+    maxBytes=10 * 1024 * 1024,
     backupCount=5,
-    encoding='utf-8'
+    encoding="utf-8",
 )
-conversation_formatter = logging.Formatter('%(asctime)s - %(message)s')
+conversation_formatter = logging.Formatter("%(asctime)s - %(message)s")
 conversation_handler.setFormatter(conversation_formatter)
 conversation_logger.addHandler(conversation_handler)
 conversation_logger.setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
+
 
 def split_long_message(text: str, max_length: int = 4000) -> list[str]:
     """将长消息分割成多个较短的消息"""
@@ -95,7 +98,6 @@ async def send_long_message(update: Update, text: str, max_length: int = 4000):
         
         # 添加短暂延迟，避免发送过快
         if i < len(messages) - 1:
-            import asyncio
             await asyncio.sleep(0.5)
     
     # 记录长消息分割情况
@@ -123,7 +125,6 @@ async def send_ai_response(update: Update, ai_response: str, time_str: str):
             
             # 添加延迟
             if i < len(ai_messages) - 1:
-                import asyncio
                 await asyncio.sleep(0.5)
         
         # 最后发送时间信息
@@ -135,6 +136,32 @@ async def send_ai_response(update: Update, ai_response: str, time_str: str):
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
+
+PERSONAS_DIR = Path('personas')
+
+
+def load_personas(directory: Path) -> dict[str, str]:
+    personas: dict[str, str] = {}
+    if not directory.exists():
+        return personas
+    for persona_file in sorted(directory.glob('*.txt')):
+        try:
+            content = persona_file.read_text(encoding='utf-8').strip()
+        except UnicodeDecodeError:
+            logging.getLogger(__name__).warning(
+                "Unable to read persona file %s due to encoding error",
+                persona_file
+            )
+            continue
+        if content:
+            personas[persona_file.stem] = content
+    return personas
+
+
+PERSONAS = load_personas(PERSONAS_DIR)
+DEFAULT_PERSONA_KEY = 'ChatBuddy' if 'ChatBuddy' in PERSONAS else next(iter(PERSONAS), None)
+if not PERSONAS:
+    logger.warning("No persona definitions found in %s", PERSONAS_DIR)
 
 # 可用的模型列表
 AVAILABLE_MODELS = {
@@ -163,6 +190,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.user_data.get('conversation_history'):
         context.user_data['conversation_history'] = []
 
+    if PERSONAS and not context.user_data.get('persona'):
+        context.user_data['persona'] = DEFAULT_PERSONA_KEY
+
     logger.info(f"用户 {username}({user_id}) 执行/start命令")
     conversation_logger.info(f"[用户 {username}({user_id})] 执行/start命令 - 初始化对话")
 
@@ -180,6 +210,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 """.format(AVAILABLE_MODELS[context.user_data['model']])
     await send_long_message(update, welcome_message)
 
+    if PERSONAS:
+        current_persona = context.user_data['persona']
+        await update.message.reply_text(
+            f"Current persona: {current_persona}\nUse /persona to switch personas."
+        )
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理 /help 命令"""
     help_text = """
@@ -195,6 +231,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 7. 如需重新开始对话，请使用 /start 命令
 """.format('\n'.join(f'   - {name}: {model}' for name, model in AVAILABLE_MODELS.items()))
     await send_long_message(update, help_text)
+
+    if PERSONAS:
+        await update.message.reply_text("Use /persona to switch the assistant persona.")
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理 /model 命令"""
@@ -213,6 +252,24 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text('请选择要使用的 AI 模型：', reply_markup=reply_markup)
+
+async def persona_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /persona command."""
+    if not PERSONAS:
+        await update.message.reply_text("No personas are configured for this bot.")
+        return
+
+    if not context.user_data.get('persona'):
+        context.user_data['persona'] = DEFAULT_PERSONA_KEY
+
+    keyboard: list[list[InlineKeyboardButton]] = []
+    current_persona = context.user_data.get('persona')
+    for name in PERSONAS:
+        prefix = "[*] " if current_persona == name else ""
+        keyboard.append([InlineKeyboardButton(f"{prefix}{name}", callback_data=f"persona_{name}")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Select the assistant persona:", reply_markup=reply_markup)
 
 async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理 /forget 命令"""
@@ -254,20 +311,65 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             logger.warning(f"用户 {username}({user_id}) 尝试选择无效模型: {model_name}")
             await query.edit_message_text('无效的模型选择')
 
-async def query_ollama(prompt: str, model: str, context_history: list = None) -> tuple[str, float]:
-    """向 Ollama API 发送请求，返回回复和生成时间"""
+    elif query.data.startswith('persona_'):
+        persona_name = query.data[8:]
+        if persona_name in PERSONAS:
+            old_persona = context.user_data.get('persona', DEFAULT_PERSONA_KEY)
+            context.user_data['persona'] = persona_name
+            context.user_data['conversation_history'] = []
+
+            logger.info(f"User {username}({user_id}) switched persona: {old_persona} -> {persona_name}")
+            conversation_logger.info(
+                f"[User {username}({user_id})] switched persona: {old_persona} -> {persona_name}"
+            )
+
+            await query.edit_message_text(
+                f'Persona updated to {persona_name}. Conversation history cleared.'
+            )
+        else:
+            logger.warning(f"User {username}({user_id}) tried invalid persona: {persona_name}")
+            await query.edit_message_text('Invalid persona selection')
+
+
+async def query_ollama(
+    prompt: str,
+    model: str,
+    context_history: list | None = None,
+    persona_prompt: str = "",
+) -> tuple[str, float]:
+    """Call the Ollama API and return the generated text and elapsed time."""
     start_time = time.time()
-    
-    # 构建包含上下文的完整提示
-    if context_history and len(context_history) > 0:
-        # 将历史对话转换为上下文格式
-        context_text = "\n".join([f"用户: {item['user']}\n助手: {item['assistant']}" for item in context_history[-10:]])  # 只保留最近10轮对话
-        full_prompt = f"以下是之前的对话历史：\n{context_text}\n\n现在用户说：{prompt}\n请根据上下文回答："
-        logger.info(f"发送API请求到Ollama - 模型: {model}, 包含{len(context_history)}轮历史对话")
-    else:
-        full_prompt = prompt
-        logger.info(f"发送API请求到Ollama - 模型: {model}, 无历史对话")
-    
+
+    history_count = len(context_history) if context_history else 0
+    persona_label = "default"
+    if persona_prompt:
+        first_line = persona_prompt.strip().splitlines()[0]
+        persona_label = first_line[:60]
+
+    sections: list[str] = []
+
+    if persona_prompt:
+        sections.append("System instructions:\n" + persona_prompt.strip())
+
+    if history_count:
+        context_lines: list[str] = []
+        for item in context_history[-10:]:
+            user_line = item.get("user", "")
+            assistant_line = item.get("assistant", "")
+            context_lines.append(f"User: {user_line}")
+            context_lines.append(f"Assistant: {assistant_line}")
+        sections.append("Conversation history:\n" + "\n".join(context_lines))
+
+    sections.append(f"User: {prompt}\nAssistant:")
+    full_prompt = "\n\n".join(sections)
+
+    logger.info(
+        "Calling Ollama - model: %s, history: %s, persona: %s",
+        model,
+        history_count,
+        persona_label,
+    )
+
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(
@@ -275,29 +377,45 @@ async def query_ollama(prompt: str, model: str, context_history: list = None) ->
                 json={
                     "model": model,
                     "prompt": full_prompt,
-                    "stream": False
-                }
+                    "stream": False,
+                },
             ) as response:
                 if response.status == 200:
                     result = await response.json()
                     end_time = time.time()
                     generation_time = end_time - start_time
-                    response_text = result.get('response', '抱歉，我现在无法回答这个问题。')
-                    logger.info(f"Ollama API响应成功 - 模型: {model}, 响应时间: {generation_time:.2f}s, 响应长度: {len(response_text)}字符")
+                    response_text = result.get("response") or "The model returned no content."
+                    logger.info(
+                        "Ollama response ready - model: %s, time: %.2fs, length: %s",
+                        model,
+                        generation_time,
+                        len(response_text),
+                    )
                     return response_text, generation_time
-                else:
-                    end_time = time.time()
-                    generation_time = end_time - start_time
-                    error_msg = f"API 请求失败，状态码：{response.status}"
-                    logger.error(f"Ollama API请求失败 - 模型: {model}, 状态码: {response.status}, 响应时间: {generation_time:.2f}s")
-                    return error_msg, generation_time
-        except Exception as e:
-            logger.error(f"请求 Ollama API 时出错: {str(e)}")
+
+                end_time = time.time()
+                generation_time = end_time - start_time
+                error_msg = f"Ollama returned status {response.status}"
+                logger.error(
+                    "Ollama error - model: %s, status: %s, time: %.2fs",
+                    model,
+                    response.status,
+                    generation_time,
+                )
+                return error_msg, generation_time
+        except Exception as exc:
+            logger.error("Error calling Ollama: %s", exc)
             end_time = time.time()
             generation_time = end_time - start_time
-            error_msg = "抱歉，与 AI 模型通信时出现错误。请确保 Ollama 服务正在运行。"
-            logger.error(f"Ollama API异常 - 模型: {model}, 错误: {str(e)}, 响应时间: {generation_time:.2f}s")
+            error_msg = "Unable to reach the Ollama service right now."
+            logger.error(
+                "Ollama exception - model: %s, error: %s, time: %.2fs",
+                model,
+                exc,
+                generation_time,
+            )
             return error_msg, generation_time
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理用户消息"""
@@ -319,6 +437,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # 确保用户有对话历史，如果没有则初始化
     if not context.user_data.get('conversation_history'):
         context.user_data['conversation_history'] = []
+
+    if PERSONAS:
+        if not context.user_data.get('persona'):
+            context.user_data['persona'] = DEFAULT_PERSONA_KEY
+        current_persona = context.user_data['persona']
+        persona_prompt = PERSONAS.get(current_persona, '')
+    else:
+        current_persona = None
+        persona_prompt = ''
+
     
     current_model = AVAILABLE_MODELS[context.user_data['model']]
     conversation_history = context.user_data['conversation_history']
@@ -329,13 +457,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     conversation_logger.info(f"[用户 {username}({user_id})] 第{conversation_round}轮 - 用户: {user_message}")
     
     # 发送"正在思考"消息
+    persona_line = f"\nPersona: {current_persona}" if current_persona else ""
     thinking_message = await update.message.reply_text(
-        f"正在思考...\n使用模型：{current_model}"
+        f"Thinking...\nUsing model: {current_model}{persona_line}"
     )
+
     
     try:
         # 获取 AI 回复和生成时间，传递对话历史
-        ai_response, generation_time = await query_ollama(user_message, current_model, conversation_history)
+        ai_response, generation_time = await query_ollama(user_message, current_model, conversation_history, persona_prompt)
         
         # 删除"正在思考"消息
         await thinking_message.delete()
@@ -398,6 +528,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("model", model_command))
+    application.add_handler(CommandHandler("persona", persona_command))
     application.add_handler(CommandHandler("forget", forget_command))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
