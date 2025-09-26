@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import time
 import aiohttp
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -25,7 +26,8 @@ AVAILABLE_MODELS = {
     'llama2': 'llama2',
     'llama2-uncensored': 'llama2-uncensored',
     'mistral': 'mistral',
-    'neural-chat': 'neural-chat'
+    'neural-chat': 'neural-chat',
+    'gpt-oss:20b': 'gpt-oss:20b'
 }
 
 # 默认模型
@@ -89,8 +91,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             await query.edit_message_text('无效的模型选择')
 
-async def query_ollama(prompt: str, model: str) -> str:
-    """向 Ollama API 发送请求"""
+async def query_ollama(prompt: str, model: str) -> tuple[str, float]:
+    """向 Ollama API 发送请求，返回回复和生成时间"""
+    start_time = time.time()
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(
@@ -103,12 +106,19 @@ async def query_ollama(prompt: str, model: str) -> str:
             ) as response:
                 if response.status == 200:
                     result = await response.json()
-                    return result.get('response', '抱歉，我现在无法回答这个问题。')
+                    end_time = time.time()
+                    generation_time = end_time - start_time
+                    response_text = result.get('response', '抱歉，我现在无法回答这个问题。')
+                    return response_text, generation_time
                 else:
-                    return f"API 请求失败，状态码：{response.status}"
+                    end_time = time.time()
+                    generation_time = end_time - start_time
+                    return f"API 请求失败，状态码：{response.status}", generation_time
         except Exception as e:
             logger.error(f"请求 Ollama API 时出错: {str(e)}")
-            return "抱歉，与 AI 模型通信时出现错误。请确保 Ollama 服务正在运行。"
+            end_time = time.time()
+            generation_time = end_time - start_time
+            return "抱歉，与 AI 模型通信时出现错误。请确保 Ollama 服务正在运行。", generation_time
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理用户消息"""
@@ -126,14 +136,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
     
     try:
-        # 获取 AI 回复
-        ai_response = await query_ollama(user_message, current_model)
+        # 获取 AI 回复和生成时间
+        ai_response, generation_time = await query_ollama(user_message, current_model)
         
         # 删除"正在思考"消息
         await thinking_message.delete()
         
+        # 格式化生成时间
+        if generation_time < 1:
+            time_str = f"{generation_time*1000:.0f}ms"
+        else:
+            time_str = f"{generation_time:.2f}s"
+        
+        # 在回复中添加生成时间信息
+        final_response = f"{ai_response}\n\n⏱️ 生成时间：{time_str}"
+        
         # 发送 AI 回复
-        await update.message.reply_text(ai_response)
+        await update.message.reply_text(final_response)
     except Exception as e:
         logger.error(f"处理消息时出错: {str(e)}")
         await thinking_message.edit_text("抱歉，处理您的消息时出现错误。请稍后重试。")
