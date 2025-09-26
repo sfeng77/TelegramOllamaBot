@@ -21,12 +21,12 @@ OLLAMA_API_URL = "http://localhost:11434/api/generate"
 
 # 可用的模型列表
 AVAILABLE_MODELS = {
-    'deepseek_small': 'deepseek-r1:1.5b',
-    'deepseek_large': 'deepseek-r1:32b',
-    'llama2': 'llama2',
-    'llama2-uncensored': 'llama2-uncensored',
-    'mistral': 'mistral',
-    'neural-chat': 'neural-chat',
+    # 'deepseek_small': 'deepseek-r1:1.5b',
+    # 'deepseek_large': 'deepseek-r1:32b',
+    # 'llama2': 'llama2',
+    # 'llama2-uncensored': 'llama2-uncensored',
+    # 'mistral': 'mistral',
+    # 'neural-chat': 'neural-chat',
     'gpt-oss:20b': 'gpt-oss:20b'
 }
 
