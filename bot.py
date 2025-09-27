@@ -4,6 +4,7 @@ import logging.handlers
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import aiohttp
 from dotenv import load_dotenv
@@ -84,6 +85,73 @@ def split_long_message(text: str, max_length: int = 4000) -> list[str]:
     
     return messages
 
+REASONING_KEYS: set[str] = {"reasoning", "thinking", "thoughts"}
+
+
+def _stringify_reasoning_segments(obj: Any) -> list[str]:
+    """Recursively flatten reasoning data into plain text segments."""
+    segments: list[str] = []
+    if isinstance(obj, str):
+        stripped = obj.strip()
+        if stripped:
+            segments.append(stripped)
+        return segments
+    if isinstance(obj, dict):
+        type_hint = obj.get("type")
+        text_value = obj.get("text")
+        if isinstance(text_value, str) and type_hint in {"reasoning", "thinking"}:
+            stripped = text_value.strip()
+            if stripped:
+                segments.append(stripped)
+        elif isinstance(text_value, str) and type_hint is None:
+            stripped = text_value.strip()
+            if stripped:
+                segments.append(stripped)
+        for key in ("content", "value", "messages", "parts"):
+            if key in obj:
+                segments.extend(_stringify_reasoning_segments(obj[key]))
+        for key, value in obj.items():
+            if key in REASONING_KEYS:
+                segments.extend(_stringify_reasoning_segments(value))
+        return segments
+    if isinstance(obj, list):
+        if obj and all(isinstance(item, (int, float)) for item in obj):
+            return segments
+        for item in obj:
+            segments.extend(_stringify_reasoning_segments(item))
+        return segments
+    return segments
+
+
+def extract_reasoning_text(payload: dict[str, Any]) -> str:
+    """Pull any reasoning or thinking content from an Ollama response payload."""
+    collected: list[str] = []
+
+    def walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key in {"context", "embedding"}:
+                    continue
+                if key in REASONING_KEYS:
+                    collected.extend(_stringify_reasoning_segments(value))
+                elif isinstance(value, (dict, list)):
+                    walk(value)
+        elif isinstance(obj, list):
+            if obj and all(isinstance(item, (int, float)) for item in obj):
+                return
+            for item in obj:
+                walk(item)
+
+    walk(payload)
+
+    unique_text: list[str] = []
+    for item in collected:
+        stripped = item.strip()
+        if stripped and stripped not in unique_text:
+            unique_text.append(stripped)
+
+    return "\n\n".join(unique_text)
+
 async def send_long_message(update: Update, text: str, max_length: int = 4000):
     """发送可能很长的消息，自动分割"""
     messages = split_long_message(text, max_length)
@@ -104,35 +172,24 @@ async def send_long_message(update: Update, text: str, max_length: int = 4000):
     if len(messages) > 1:
         logger.info(f"长消息已分割为 {len(messages)} 条消息发送")
 
-async def send_ai_response(update: Update, ai_response: str, time_str: str):
-    """专门用于发送AI回复的函数，确保时间信息正确显示"""
-    # 检查是否需要分割
-    full_response = f"{ai_response}\n\n⏱️ 生成时间：{time_str}"
-    
-    if len(full_response) <= 4000:
-        # 消息不长，直接发送
-        await update.message.reply_text(full_response)
-    else:
-        # 消息太长，需要分割
-        # 先发送AI回复内容
-        ai_messages = split_long_message(ai_response, 4000)
-        
-        for i, message in enumerate(ai_messages):
-            if i == 0:
-                await update.message.reply_text(message)
-            else:
-                await update.message.reply_text(f"（续 {i+1}/{len(ai_messages)}）\n\n{message}")
-            
-            # 添加延迟
-            if i < len(ai_messages) - 1:
-                await asyncio.sleep(0.5)
-        
-        # 最后发送时间信息
-        await update.message.reply_text(f"⏱️ 生成时间：{time_str}")
-        
-        logger.info(f"AI回复已分割为 {len(ai_messages)} 条消息 + 时间信息发送")
+async def send_ai_response(update: Update, ai_response: str, time_str: str, thinking: str | None = None) -> None:
+    """Send the AI response and optional reasoning text to the user."""
+    sections: list[str] = []
+    if thinking:
+        sanitized_thinking = thinking.strip()
+        if sanitized_thinking:
+            sections.append("Thought process (model reasoning):\n<<BEGIN THOUGHT>>\n" + sanitized_thinking + "\n<<END THOUGHT>>")
 
-# 加载环境变量
+    response_body = ai_response.strip()
+    if response_body:
+        sections.append(response_body)
+
+    sections.append(f"Generated in {time_str}")
+
+    combined_message = "\n\n".join(section for section in sections if section)
+    await send_long_message(update, combined_message)
+
+# Load environment variables
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
@@ -207,8 +264,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 /help - 获取帮助
 /model - 选择 AI 模型
 /forget - 忘记之前的对话内容
+/persona - 选择助手角色
+/thoughts - 切换是否展示思考过程
 """.format(AVAILABLE_MODELS[context.user_data['model']])
     await send_long_message(update, welcome_message)
+    await update.message.reply_text("Use /thoughts to toggle whether I share my thought process.")
 
     if PERSONAS:
         current_persona = context.user_data['persona']
@@ -225,15 +285,51 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 2. 机器人会记住对话上下文，提供更连贯的对话体验
 3. 使用 /model 命令可以切换不同的 AI 模型
 4. 使用 /forget 命令可以清除对话历史，重新开始
-5. 当前支持的模型：
+5. 使用 /persona 命令可以选择助手角色
+6. 使用 /thoughts 命令可以开关思考过程展示
+7. 当前支持的模型：
 {}
-6. 如果遇到问题，请尝试重新发送消息
-7. 如需重新开始对话，请使用 /start 命令
+8. 如果遇到问题，请尝试重新发送消息
+9. 如需重新开始对话，请使用 /start 命令
 """.format('\n'.join(f'   - {name}: {model}' for name, model in AVAILABLE_MODELS.items()))
     await send_long_message(update, help_text)
+    await update.message.reply_text("Use /thoughts [on|off] or run without arguments to toggle the thought process display.")
 
     if PERSONAS:
         await update.message.reply_text("Use /persona to switch the assistant persona.")
+
+async def thoughts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /thoughts command to toggle reasoning visibility."""
+    if not update.message:
+        return
+
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "Unknown"
+    context.user_data.setdefault('show_thoughts', False)
+    current_state = context.user_data['show_thoughts']
+
+    new_state = current_state
+    if context.args:
+        choice = context.args[0].lower()
+        if choice in {"on", "enable", "true", "1"}:
+            new_state = True
+        elif choice in {"off", "disable", "false", "0"}:
+            new_state = False
+        else:
+            await update.message.reply_text("Usage: /thoughts [on|off]")
+            return
+    else:
+        new_state = not current_state
+
+    context.user_data['show_thoughts'] = new_state
+    state_label = "enabled" if new_state else "disabled"
+    logger.info(f"Thought display {state_label} for user {username}({user_id})")
+
+    if new_state:
+        await update.message.reply_text("Thought process display enabled. I'll include sections between <<BEGIN THOUGHT>> and <<END THOUGHT>>.")
+    else:
+        await update.message.reply_text("Thought process display disabled. I'll keep the reasoning hidden.")
+
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理 /model 命令"""
@@ -336,8 +432,8 @@ async def query_ollama(
     model: str,
     context_history: list | None = None,
     persona_prompt: str = "",
-) -> tuple[str, float]:
-    """Call the Ollama API and return the generated text and elapsed time."""
+) -> tuple[str, str | None, float]:
+    """Call the Ollama API and return the generated text, reasoning text, and elapsed time."""
     start_time = time.time()
 
     history_count = len(context_history) if context_history else 0
@@ -381,17 +477,21 @@ async def query_ollama(
                 },
             ) as response:
                 if response.status == 200:
-                    result = await response.json()
+                    result: dict[str, Any] = await response.json()
+                    logger.debug("Ollama response: %s", result)
                     end_time = time.time()
                     generation_time = end_time - start_time
                     response_text = result.get("response") or "The model returned no content."
+                    thinking_text = extract_reasoning_text(result) or None
+                    if thinking_text:
+                        logger.debug("Ollama reasoning captured (%s chars)", len(thinking_text))
                     logger.info(
                         "Ollama response ready - model: %s, time: %.2fs, length: %s",
                         model,
                         generation_time,
                         len(response_text),
                     )
-                    return response_text, generation_time
+                    return response_text, thinking_text, generation_time
 
                 end_time = time.time()
                 generation_time = end_time - start_time
@@ -402,7 +502,7 @@ async def query_ollama(
                     response.status,
                     generation_time,
                 )
-                return error_msg, generation_time
+                return error_msg, None, generation_time
         except Exception as exc:
             logger.error("Error calling Ollama: %s", exc)
             end_time = time.time()
@@ -414,8 +514,7 @@ async def query_ollama(
                 exc,
                 generation_time,
             )
-            return error_msg, generation_time
-
+            return error_msg, None, generation_time
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理用户消息"""
@@ -447,7 +546,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         current_persona = None
         persona_prompt = ''
 
-    
+    context.user_data.setdefault('show_thoughts', False)
+    show_thoughts = context.user_data['show_thoughts']
+
     current_model = AVAILABLE_MODELS[context.user_data['model']]
     conversation_history = context.user_data['conversation_history']
     conversation_round = len(conversation_history) + 1
@@ -465,7 +566,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     try:
         # 获取 AI 回复和生成时间，传递对话历史
-        ai_response, generation_time = await query_ollama(user_message, current_model, conversation_history, persona_prompt)
+        ai_response, thinking_text, generation_time = await query_ollama(user_message, current_model, conversation_history, persona_prompt)
         
         # 删除"正在思考"消息
         await thinking_message.delete()
@@ -473,6 +574,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # 记录AI回复
         logger.info(f"AI回复生成完成 - 用户: {username}({user_id}), 模型: {current_model}, 时间: {generation_time:.2f}s")
         conversation_logger.info(f"[用户 {username}({user_id})] 第{conversation_round}轮 - AI回复: {ai_response}")
+        if thinking_text:
+            conversation_logger.info(f"[用户 {username}({user_id})] 第{conversation_round}轮 - AI思考: {thinking_text}")
         
         # 将当前对话添加到历史记录中
         conversation_history.append({
@@ -493,7 +596,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             time_str = f"{generation_time:.2f}s"
         
         # 发送 AI 回复，支持长消息分割
-        await send_ai_response(update, ai_response, time_str)
+        display_thinking = thinking_text if show_thoughts else None
+        await send_ai_response(update, ai_response, time_str, display_thinking)
         
         # 记录对话完成
         conversation_logger.info(f"[用户 {username}({user_id})] 第{conversation_round}轮对话完成 - 历史记录长度: {len(conversation_history)}")
@@ -527,6 +631,7 @@ def main() -> None:
     # 添加处理器
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("thoughts", thoughts_command))
     application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("persona", persona_command))
     application.add_handler(CommandHandler("forget", forget_command))
