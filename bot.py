@@ -195,16 +195,19 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
 
-ALLOWED_USERNAMES_ENV = os.getenv('ALLOWED_TELEGRAM_USERNAMES', '')
-ALLOWED_USERNAMES: set[str] = set()
-if ALLOWED_USERNAMES_ENV:
-    for raw_value in ALLOWED_USERNAMES_ENV.split(','):
-        trimmed_value = raw_value.strip().lstrip('@')
+ALLOWED_USER_IDS_ENV = os.getenv('ALLOWED_TELEGRAM_USER_IDS', '')
+ALLOWED_USER_IDS: set[int] = set()
+if ALLOWED_USER_IDS_ENV:
+    for raw_value in ALLOWED_USER_IDS_ENV.split(','):
+        trimmed_value = raw_value.strip()
         if not trimmed_value:
             continue
-        ALLOWED_USERNAMES.add(trimmed_value.lower())
-if not ALLOWED_USERNAMES:
-    logger.warning("ALLOWED_TELEGRAM_USERNAMES is empty; bot will deny all users until configured.")
+        try:
+            ALLOWED_USER_IDS.add(int(trimmed_value))
+        except ValueError:
+            logger.warning("Invalid user ID '%s' in ALLOWED_TELEGRAM_USER_IDS; ignoring.", trimmed_value)
+if not ALLOWED_USER_IDS:
+    logger.warning("ALLOWED_TELEGRAM_USER_IDS is empty; bot will deny all users until configured.")
 
 PERSONAS_DIR = Path('personas')
 
@@ -263,14 +266,8 @@ async def ensure_user_allowed(update: Update) -> bool:
         await _deny_access(update)
         return False
 
-    username = (user.username or '').strip()
-    user_identifier = f"{username or 'Unknown'}({user.id})"
-    if not username:
-        logger.warning('User %s has no username; denying access in username whitelist mode.', user_identifier)
-        await _deny_access(update)
-        return False
-
-    if username.lower() in ALLOWED_USERNAMES:
+    user_identifier = f"{user.username or 'Unknown'}({user.id})"
+    if user.id in ALLOWED_USER_IDS:
         return True
 
     logger.warning('Unauthorized access attempt from %s', user_identifier)
