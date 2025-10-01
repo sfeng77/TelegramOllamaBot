@@ -332,12 +332,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 {}
 8. 如果遇到问题，请尝试重新发送消息
 9. 如需重新开始对话，请使用 /start 命令
-""".format('\n'.join(f'   - {name}: {model}' for name, model in AVAILABLE_MODELS.items()))
+""".format('\n'.join(f'   - {name}' for name in AVAILABLE_MODELS.keys()))
     await send_long_message(update, help_text)
-    await update.message.reply_text("Use /thoughts [on|off] or run without arguments to toggle the thought process display.")
-
-    if PERSONAS:
-        await update.message.reply_text("Use /persona to switch the assistant persona.")
 
 @whitelist_required
 async def thoughts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
