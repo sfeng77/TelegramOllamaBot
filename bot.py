@@ -291,29 +291,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理 /start 命令"""
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
-    
-    # 初始化用户设置
-    if not context.user_data.get('model'):
-        context.user_data['model'] = DEFAULT_MODEL
-    
-    # 初始化对话历史
-    if not context.user_data.get('conversation_history'):
-        context.user_data['conversation_history'] = []
 
-    if PERSONAS and not context.user_data.get('persona'):
-        context.user_data['persona'] = DEFAULT_PERSONA_KEY
+    state = context.chat_data
+
+    if not state.get('model'):
+        state['model'] = DEFAULT_MODEL
+
+    if not state.get('conversation_history'):
+        state['conversation_history'] = []
+
+    if PERSONAS and not state.get('persona'):
+        state['persona'] = DEFAULT_PERSONA_KEY
 
     logger.info(f"用户 {username}({user_id}) 执行/start命令")
     conversation_logger.info(f"[用户 {username}({user_id})] 执行/start命令 - 初始化对话")
 
-    welcome_message = """
-欢迎使用 AI 聊天机器人！
+    current_model_key = state['model']
+    current_model = AVAILABLE_MODELS[current_model_key]
+    persona_value = state.get('persona') if PERSONAS else None
+    if not persona_value:
+        persona_value = "None"
 
-这个机器人使用 Ollama 来回答您的问题。
-当前使用的模型是：{}
-当前的助手角色是：{}
-/help 命令可查看使用说明。
-""".format(AVAILABLE_MODELS[context.user_data['model']], context.user_data['persona'] if PERSONAS else "null")
+    welcome_message = (
+        "欢迎使用 AI 聊天机器人！\n\n"
+        "这个机器人使用 Ollama 来回答您的问题。\n"
+        f"当前使用的模型是：{current_model}\n"
+        f"当前的助手角色是：{persona_value}\n"
+        "/help 命令可查看使用说明。"
+    )
     await send_long_message(update, welcome_message)
 
 @whitelist_required
@@ -331,7 +336,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 7. 当前支持的模型：
 {}
 8. 如果遇到问题，请尝试重新发送消息
-9. 如需重新开始对话，请使用 /start 命令
 """.format('\n'.join(f'   - {name}' for name in AVAILABLE_MODELS.keys()))
     await send_long_message(update, help_text)
 
@@ -343,8 +347,9 @@ async def thoughts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
-    context.user_data.setdefault('show_thoughts', False)
-    current_state = context.user_data['show_thoughts']
+    state = context.chat_data
+    state.setdefault('show_thoughts', False)
+    current_state = state['show_thoughts']
 
     new_state = current_state
     if context.args:
@@ -359,7 +364,7 @@ async def thoughts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     else:
         new_state = not current_state
 
-    context.user_data['show_thoughts'] = new_state
+    state['show_thoughts'] = new_state
     state_label = "enabled" if new_state else "disabled"
     logger.info(f"Thought display {state_label} for user {username}({user_id})")
 
@@ -374,17 +379,16 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """处理 /model 命令"""
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
-    current_model = context.user_data.get('model', DEFAULT_MODEL)
-    
-    logger.info(f"用户 {username}({user_id}) 执行/model命令 - 当前模型: {current_model}")
-    
+    state = context.chat_data
+    current_model_key = state.get('model', DEFAULT_MODEL)
+
+    logger.info(f"用户 {username}({user_id}) 执行/model命令 - 当前模型: {current_model_key}")
+
     keyboard = []
-    # 创建模型选择按钮
     for name, model in AVAILABLE_MODELS.items():
-        # 在当前选中的模型旁边添加标记
-        current = '✓ ' if context.user_data.get('model') == name else ''
+        current = '✓ ' if state.get('model', DEFAULT_MODEL) == name else ''
         keyboard.append([InlineKeyboardButton(f"{current}{model}", callback_data=f"model_{name}")])
-    
+
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text('请选择要使用的 AI 模型：', reply_markup=reply_markup)
 
@@ -395,11 +399,12 @@ async def persona_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("No personas are configured for this bot.")
         return
 
-    if not context.user_data.get('persona'):
-        context.user_data['persona'] = DEFAULT_PERSONA_KEY
+    state = context.chat_data
+    if not state.get('persona'):
+        state['persona'] = DEFAULT_PERSONA_KEY
 
     keyboard: list[list[InlineKeyboardButton]] = []
-    current_persona = context.user_data.get('persona')
+    current_persona = state.get('persona')
     for name in PERSONAS:
         prefix = "[*] " if current_persona == name else ""
         keyboard.append([InlineKeyboardButton(f"{prefix}{name}", callback_data=f"persona_{name}")])
@@ -412,17 +417,15 @@ async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """处理 /forget 命令"""
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
-    
-    # 记录清除前的历史长度
-    history_length = len(context.user_data.get('conversation_history', []))
-    
-    # 清除对话历史
-    context.user_data['conversation_history'] = []
-    
-    # 记录清除操作
+
+    state = context.chat_data
+    history_length = len(state.get('conversation_history', []))
+
+    state['conversation_history'] = []
+
     logger.info(f"用户 {username}({user_id}) 执行/forget命令 - 清除了{history_length}轮对话历史")
     conversation_logger.info(f"[用户 {username}({user_id})] 执行/forget命令 - 清除了{history_length}轮对话历史")
-    
+
     await update.message.reply_text("🧹 已清除所有对话历史，我们可以重新开始对话了！")
 
 @whitelist_required
@@ -431,19 +434,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
-    
+    state = context.chat_data
+
     await query.answer()
 
     if query.data.startswith('model_'):
         model_name = query.data[6:]  # 移除 'model_' 前缀
         if model_name in AVAILABLE_MODELS:
-            old_model = context.user_data.get('model', DEFAULT_MODEL)
-            context.user_data['model'] = model_name
+            old_model = state.get('model', DEFAULT_MODEL)
+            state['model'] = model_name
             new_model = AVAILABLE_MODELS[model_name]
-            
+
             logger.info(f"用户 {username}({user_id}) 切换模型: {old_model} -> {model_name}")
             conversation_logger.info(f"[用户 {username}({user_id})] 切换模型: {old_model} -> {new_model}")
-            
+
             await query.edit_message_text(f'已切换到模型：{new_model}')
         else:
             logger.warning(f"用户 {username}({user_id}) 尝试选择无效模型: {model_name}")
@@ -452,9 +456,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif query.data.startswith('persona_'):
         persona_name = query.data[8:]
         if persona_name in PERSONAS:
-            old_persona = context.user_data.get('persona', DEFAULT_PERSONA_KEY)
-            context.user_data['persona'] = persona_name
-            context.user_data['conversation_history'] = []
+            old_persona = state.get('persona', DEFAULT_PERSONA_KEY)
+            state['persona'] = persona_name
+            state['conversation_history'] = []
 
             logger.info(f"User {username}({user_id}) switched persona: {old_persona} -> {persona_name}")
             conversation_logger.info(
@@ -474,6 +478,7 @@ async def query_ollama(
     model: str,
     context_history: list | None = None,
     persona_prompt: str = "",
+    speaker_label: str | None = None,
 ) -> tuple[str, str | None, float]:
     """Call the Ollama API and return the generated text, reasoning text, and elapsed time."""
     start_time = time.time()
@@ -498,7 +503,8 @@ async def query_ollama(
             context_lines.append(f"Assistant: {assistant_line}")
         sections.append("Conversation history:\n" + "\n".join(context_lines))
 
-    sections.append(f"User: {prompt}\nAssistant:")
+    current_prompt = speaker_label or prompt
+    sections.append(f"User: {current_prompt}\nAssistant:")
     full_prompt = "\n\n".join(sections)
 
     logger.info(
@@ -561,93 +567,101 @@ async def query_ollama(
 @whitelist_required
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理用户消息"""
-    # 检查消息是否存在且为文本消息
     if not update.message or not update.message.text:
         if update.message:
-            # 如果是非文本消息，回复提示
             await update.message.reply_text("抱歉，我只处理文本消息。请发送文字内容。")
         return
-    
+
     user_message = update.message.text
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
-    
-    # 确保用户有选择的模型，如果没有则使用默认模型
-    if not context.user_data.get('model'):
-        context.user_data['model'] = DEFAULT_MODEL
-    
-    # 确保用户有对话历史，如果没有则初始化
-    if not context.user_data.get('conversation_history'):
-        context.user_data['conversation_history'] = []
+    state = context.chat_data
+
+    if not state.get('model'):
+        state['model'] = DEFAULT_MODEL
+
+    if not state.get('conversation_history'):
+        state['conversation_history'] = []
 
     if PERSONAS:
-        if not context.user_data.get('persona'):
-            context.user_data['persona'] = DEFAULT_PERSONA_KEY
-        current_persona = context.user_data['persona']
+        if not state.get('persona'):
+            state['persona'] = DEFAULT_PERSONA_KEY
+        current_persona = state.get('persona')
         persona_prompt = PERSONAS.get(current_persona, '')
     else:
         current_persona = None
         persona_prompt = ''
 
-    context.user_data.setdefault('show_thoughts', False)
-    show_thoughts = context.user_data['show_thoughts']
+    state.setdefault('show_thoughts', False)
+    show_thoughts = state['show_thoughts']
 
-    current_model = AVAILABLE_MODELS[context.user_data['model']]
-    conversation_history = context.user_data['conversation_history']
+    current_model_key = state['model']
+    current_model = AVAILABLE_MODELS[current_model_key]
+    conversation_history = state['conversation_history']
+
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    chat_title = chat.title if chat and chat.title else None
+    if chat_title:
+        chat_label = f"{chat_title}({chat_id})"
+    elif chat_id is not None:
+        chat_label = f"Chat {chat_id}"
+    else:
+        chat_label = "Chat unknown"
+
+    is_group_chat = bool(chat and chat.type in {'group', 'supergroup'})
+    speaker_name = update.effective_user.username or update.effective_user.full_name or "Unknown"
+    speaker_label = f"{speaker_name} ({user_id})"
+    user_entry_text = f"{speaker_label}: {user_message}" if is_group_chat else user_message
+
     conversation_round = len(conversation_history) + 1
-    
-    # 记录用户消息
-    logger.info(f"用户 {username}({user_id}) 发送消息 - 第{conversation_round}轮对话")
-    conversation_logger.info(f"[用户 {username}({user_id})] 第{conversation_round}轮 - 用户: {user_message}")
-    
-    # 发送"正在思考"消息
+
+    logger.info(f"用户 {username}({user_id}) 在 {chat_label} 发送消息 - 第{conversation_round}轮对话")
+    conversation_logger.info(f"[{chat_label}] [用户 {username}({user_id})] 第{conversation_round}轮 - 用户: {user_entry_text}")
+
     persona_line = f"\nPersona: {current_persona}" if current_persona else ""
     thinking_message = await update.message.reply_text(
         f"Thinking...\nUsing model: {current_model}{persona_line}"
     )
 
-    
     try:
-        # 获取 AI 回复和生成时间，传递对话历史
-        ai_response, thinking_text, generation_time = await query_ollama(user_message, current_model, conversation_history, persona_prompt)
-        
-        # 删除"正在思考"消息
+        ai_response, thinking_text, generation_time = await query_ollama(
+            user_message,
+            current_model,
+            conversation_history,
+            persona_prompt,
+            user_entry_text,
+        )
+
         await thinking_message.delete()
-        
-        # 记录AI回复
+
         logger.info(f"AI回复生成完成 - 用户: {username}({user_id}), 模型: {current_model}, 时间: {generation_time:.2f}s")
-        conversation_logger.info(f"[用户 {username}({user_id})] 第{conversation_round}轮 - AI回复: {ai_response}")
+        conversation_logger.info(f"[{chat_label}] [用户 {username}({user_id})] 第{conversation_round}轮 - AI回复: {ai_response}")
         if thinking_text:
-            conversation_logger.info(f"[用户 {username}({user_id})] 第{conversation_round}轮 - AI思考: {thinking_text}")
-        
-        # 将当前对话添加到历史记录中
+            conversation_logger.info(f"[{chat_label}] [用户 {username}({user_id})] 第{conversation_round}轮 - AI思考: {thinking_text}")
+
         conversation_history.append({
-            'user': user_message,
+            'user': user_entry_text,
             'assistant': ai_response
         })
-        
-        # 限制历史记录长度，避免上下文过长
-        if len(conversation_history) > 20:  # 保留最近20轮对话
-            conversation_history = conversation_history[-20:]
-            context.user_data['conversation_history'] = conversation_history
-            logger.info(f"用户 {username}({user_id}) 对话历史已限制为20轮")
-        
-        # 格式化生成时间
+
+        if len(conversation_history) > 20:
+            del conversation_history[:-20]
+            logger.info(f"{chat_label} 的对话历史已限制为20轮")
+
         if generation_time < 1:
             time_str = f"{generation_time*1000:.0f}ms"
         else:
             time_str = f"{generation_time:.2f}s"
-        
-        # 发送 AI 回复，支持长消息分割
+
         display_thinking = thinking_text if show_thoughts else None
         await send_ai_response(update, ai_response, time_str, display_thinking)
-        
-        # 记录对话完成
-        conversation_logger.info(f"[用户 {username}({user_id})] 第{conversation_round}轮对话完成 - 历史记录长度: {len(conversation_history)}")
-        
+
+        conversation_logger.info(f"[{chat_label}] [用户 {username}({user_id})] 第{conversation_round}轮对话完成 - 历史记录长度: {len(conversation_history)}")
+
     except Exception as e:
         logger.error(f"处理消息时出错: {str(e)}")
-        conversation_logger.error(f"[用户 {username}({user_id})] 第{conversation_round}轮对话出错: {str(e)}")
+        conversation_logger.error(f"[{chat_label}] [用户 {username}({user_id})] 第{conversation_round}轮对话出错: {str(e)}")
         await thinking_message.edit_text("抱歉，处理您的消息时出现错误。请稍后重试。")
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
