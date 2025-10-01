@@ -3,8 +3,9 @@ import logging
 import logging.handlers
 import os
 import time
+from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import aiohttp
 from dotenv import load_dotenv
@@ -194,6 +195,17 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
 
+ALLOWED_USERNAMES_ENV = os.getenv('ALLOWED_TELEGRAM_USERNAMES', '')
+ALLOWED_USERNAMES: set[str] = set()
+if ALLOWED_USERNAMES_ENV:
+    for raw_value in ALLOWED_USERNAMES_ENV.split(','):
+        trimmed_value = raw_value.strip().lstrip('@')
+        if not trimmed_value:
+            continue
+        ALLOWED_USERNAMES.add(trimmed_value.lower())
+if not ALLOWED_USERNAMES:
+    logger.warning("ALLOWED_TELEGRAM_USERNAMES is empty; bot will deny all users until configured.")
+
 PERSONAS_DIR = Path('personas')
 
 
@@ -234,6 +246,50 @@ AVAILABLE_MODELS = {
 # 默认模型
 DEFAULT_MODEL = 'gpt-oss:20b'
 
+async def _deny_access(update: Update) -> None:
+    """Inform the user that access is restricted."""
+    if update.callback_query:
+        await update.callback_query.answer('Access denied. This bot is limited to approved users.', show_alert=True)
+        return
+    if update.effective_message:
+        await update.effective_message.reply_text('Access denied. This bot is limited to approved users.')
+
+
+async def ensure_user_allowed(update: Update) -> bool:
+    """Return True when the update comes from a whitelisted user."""
+    user = update.effective_user
+    if not user:
+        logger.warning('Received update without an effective user; denying access.')
+        await _deny_access(update)
+        return False
+
+    username = (user.username or '').strip()
+    user_identifier = f"{username or 'Unknown'}({user.id})"
+    if not username:
+        logger.warning('User %s has no username; denying access in username whitelist mode.', user_identifier)
+        await _deny_access(update)
+        return False
+
+    if username.lower() in ALLOWED_USERNAMES:
+        return True
+
+    logger.warning('Unauthorized access attempt from %s', user_identifier)
+    conversation_logger.info(f"[Unauthorized {user_identifier}] Access denied by whitelist policy")
+    await _deny_access(update)
+    return False
+
+
+def whitelist_required(handler: Callable[..., Awaitable[Any]]):
+    """Wrap a handler so it only runs for whitelisted users."""
+    @wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args: Any, **kwargs: Any):
+        if not await ensure_user_allowed(update):
+            return
+        return await handler(update, context, *args, **kwargs)
+
+    return wrapper
+
+@whitelist_required
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理 /start 命令"""
     user_id = update.effective_user.id
@@ -258,24 +314,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 这个机器人使用 Ollama 来回答您的问题。
 当前使用的模型是：{}
-
-命令列表：
-/start - 显示此帮助信息
-/help - 获取帮助
-/model - 选择 AI 模型
-/forget - 忘记之前的对话内容
-/persona - 选择助手角色
-/thoughts - 切换是否展示思考过程
-""".format(AVAILABLE_MODELS[context.user_data['model']])
+当前的助手角色是：{}
+/help 命令可查看使用说明。
+""".format(AVAILABLE_MODELS[context.user_data['model']], context.user_data['persona'] if PERSONAS else "null")
     await send_long_message(update, welcome_message)
-    await update.message.reply_text("Use /thoughts to toggle whether I share my thought process.")
 
-    if PERSONAS:
-        current_persona = context.user_data['persona']
-        await update.message.reply_text(
-            f"Current persona: {current_persona}\nUse /persona to switch personas."
-        )
-
+@whitelist_required
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理 /help 命令"""
     help_text = """
@@ -298,6 +342,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if PERSONAS:
         await update.message.reply_text("Use /persona to switch the assistant persona.")
 
+@whitelist_required
 async def thoughts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /thoughts command to toggle reasoning visibility."""
     if not update.message:
@@ -331,6 +376,7 @@ async def thoughts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("Thought process display disabled. I'll keep the reasoning hidden.")
 
 
+@whitelist_required
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理 /model 命令"""
     user_id = update.effective_user.id
@@ -349,6 +395,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text('请选择要使用的 AI 模型：', reply_markup=reply_markup)
 
+@whitelist_required
 async def persona_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /persona command."""
     if not PERSONAS:
@@ -367,6 +414,7 @@ async def persona_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("Select the assistant persona:", reply_markup=reply_markup)
 
+@whitelist_required
 async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理 /forget 命令"""
     user_id = update.effective_user.id
@@ -384,6 +432,7 @@ async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     await update.message.reply_text("🧹 已清除所有对话历史，我们可以重新开始对话了！")
 
+@whitelist_required
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理按钮回调"""
     query = update.callback_query
@@ -516,6 +565,7 @@ async def query_ollama(
             )
             return error_msg, None, generation_time
 
+@whitelist_required
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理用户消息"""
     # 检查消息是否存在且为文本消息
@@ -639,7 +689,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # 启动机器人
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == '__main__':
     main() 
