@@ -3,13 +3,14 @@ import logging
 import logging.handlers
 import os
 import time
+from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import aiohttp
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Message
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -194,6 +195,7 @@ async def send_ai_response(update: Update, ai_response: str, time_str: str, thin
 
     combined_message = "\n\n".join(section for section in sections if section)
     await send_long_message(update, combined_message)
+
 
 async def on_startup(application: Application) -> None:
     """Initialise persistent storage when the bot starts."""
@@ -380,6 +382,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 {}
 8. 如果遇到问题，请尝试重新发送消息
 """.format('\n'.join(f'   - {name}' for name in AVAILABLE_MODELS.keys()))
+    help_text += "\n9. Use /recap hour or /recap day to summarize recent messages.\n"
     await send_long_message(update, help_text)
 
 @whitelist_required
@@ -471,6 +474,225 @@ async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await update.message.reply_text("🧹 已清除所有对话历史，我们可以重新开始对话了！")
 
+async def _send_recap_output(message: Message, text: str) -> None:
+    """Send a recap message, splitting it when needed."""
+    chunks = split_long_message(text)
+    for index, chunk in enumerate(chunks):
+        if index == 0:
+            await message.reply_text(chunk)
+        else:
+            await message.reply_text(f"Part {index + 1}/{len(chunks)}\n\n{chunk}")
+        if index < len(chunks) - 1:
+            await asyncio.sleep(0.5)
+
+
+@whitelist_required
+async def recap_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /recap command with selectable time ranges."""
+    if not update.message:
+        return
+
+    user = update.effective_user
+    user_id = user.id if user else None
+    username = (user.username or user.full_name or "Unknown") if user else "Unknown"
+
+    selection: tuple[int, str] | None = None
+    if context.args:
+        arg_text = ' '.join(context.args).lower().strip()
+        selection = resolve_recap_timespan(arg_text)
+        if not selection:
+            await update.message.reply_text('Invalid recap range. Use /recap hour or /recap day.')
+            return
+
+    if not selection:
+        keyboard = [
+            [
+                InlineKeyboardButton('Last hour', callback_data='recap_hour'),
+                InlineKeyboardButton('Last day', callback_data='recap_day'),
+            ]
+        ]
+        await update.message.reply_text('Select the recap range:', reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    timespan_seconds, timespan_label = selection
+    await _execute_recap(context, update.message, user_id, username, timespan_seconds, timespan_label)
+
+
+async def _execute_recap(
+    context: ContextTypes.DEFAULT_TYPE,
+    message: Message | None,
+    user_id: int | None,
+    username: str,
+    timespan_seconds: int,
+    timespan_label: str,
+) -> None:
+    """Shared recap generator used by both command and button flows."""
+    if not message:
+        logger.error('No message available to reply to for recap.')
+        return
+
+    state = context.chat_data
+    state.setdefault('model', DEFAULT_MODEL)
+    state.setdefault('conversation_history', [])
+    state.setdefault('show_thoughts', False)
+    if PERSONAS and not state.get('persona'):
+        state['persona'] = DEFAULT_PERSONA_KEY
+
+    chat = message.chat
+    chat_id = chat.id if chat else None
+    chat_title = chat.title if chat and chat.title else None
+    if chat_title:
+        chat_label = f"{chat_title}({chat_id})"
+    elif chat_id is not None:
+        chat_label = f"Chat {chat_id}"
+    else:
+        chat_label = "Chat unknown"
+
+    span_phrase = timespan_label.lower()
+    now_ts = time.time()
+    since_ts = now_ts - timespan_seconds
+
+    timeline: list[tuple[float, str]] = []
+    user_message_count = 0
+    assistant_message_count = 0
+    history_source = 'database' if STORAGE_AVAILABLE else 'memory'
+
+    if STORAGE_AVAILABLE and chat_id is not None:
+        try:
+            persisted = await storage.fetch_messages(chat_id, since_ts, now_ts, limit=600)
+            for entry in persisted:
+                text_value = (entry.text or '').strip()
+                if not text_value:
+                    continue
+                ts_value = entry.ts
+                speaker = 'Assistant' if entry.role == 'assistant' else entry.sender_username or (f"User {entry.sender_id}" if entry.sender_id else 'User')
+                timestamp_label = datetime.fromtimestamp(ts_value).strftime('%H:%M')
+                timeline.append((ts_value, f"[{timestamp_label}] {speaker}: {text_value}"))
+                if entry.role == 'assistant':
+                    assistant_message_count += 1
+                else:
+                    user_message_count += 1
+        except Exception as exc:
+            history_source = 'memory'
+            logger.warning('Failed to read persisted history for chat %s: %s', chat_id, exc)
+            timeline.clear()
+            user_message_count = assistant_message_count = 0
+    else:
+        history_source = 'memory'
+
+    if not timeline:
+        conversation_history: list[dict[str, Any]] = state['conversation_history']
+        for item in conversation_history:
+            raw_ts = item.get('timestamp')
+            try:
+                item_ts = float(raw_ts) if raw_ts is not None else None
+            except (TypeError, ValueError):
+                item_ts = None
+            if item_ts is None:
+                item_ts = now_ts
+            if item_ts < since_ts or item_ts > now_ts:
+                continue
+            ts_label = datetime.fromtimestamp(item_ts).strftime('%H:%M')
+            user_line = item.get('user', '').strip()
+            assistant_line = item.get('assistant', '').strip()
+            if user_line:
+                timeline.append((item_ts, f"[{ts_label}] User: {user_line}"))
+                user_message_count += 1
+            if assistant_line:
+                timeline.append((item_ts + 0.001, f"[{ts_label}] Assistant: {assistant_line}"))
+                assistant_message_count += 1
+
+    if not timeline:
+        conversation_logger.info(
+            f"[{chat_label}] [User {username}({user_id})] /recap requested for {timespan_label} but no activity."
+        )
+        await message.reply_text(f"No conversation activity in the {span_phrase} to summarize.")
+        return
+
+    timeline.sort(key=lambda item: item[0])
+    transcript = "\n".join(line for _, line in timeline)
+    exchange_count = max(user_message_count, assistant_message_count, 1)
+
+    conversation_logger.info(
+        f"[{chat_label}] [User {username}({user_id})] requested /recap ({timespan_label}) - considering {len(timeline)} messages from {history_source}."
+    )
+
+    status_message = await message.reply_text(f"Generating {span_phrase} recap...")
+
+    current_model_key = state.get('model', DEFAULT_MODEL)
+    current_model = AVAILABLE_MODELS.get(current_model_key, AVAILABLE_MODELS[DEFAULT_MODEL])
+
+    persona_prompt = ''
+    if PERSONAS:
+        persona_key = state.get('persona', DEFAULT_PERSONA_KEY)
+        persona_prompt = PERSONAS.get(persona_key, '')
+
+    recap_prompt = (
+        "You are a helpful assistant that summarizes chat conversations.\n"
+        f"Using the following transcript from roughly the past {span_phrase}, create a concise recap that highlights:\n"
+        "- Main topics or themes\n"
+        "- Decisions or conclusions\n"
+        "- Action items or follow-ups\n"
+        "- Open questions or unresolved points\n"
+        "Keep the recap brief and formatted as bullet points when appropriate.\n"
+        "Use the language of the original discussions.\n\n"
+        "Transcript:\n"
+        f"{transcript}\n"
+        "Recap:"
+    )
+
+    try:
+        ai_response, thinking_text, generation_time = await query_ollama(
+            recap_prompt,
+            current_model,
+            [],
+            persona_prompt,
+        )
+
+        try:
+            await status_message.delete()
+        except Exception:
+            pass
+
+        if generation_time < 1:
+            time_str = f"{generation_time*1000:.0f}ms"
+        else:
+            time_str = f"{generation_time:.2f}s"
+
+        show_thoughts = state['show_thoughts']
+        display_thinking = thinking_text if show_thoughts else None
+
+        header_lines: list[str] = []
+        if history_source != 'database':
+            header_lines.append('Note: Using in-session history only (persistent log unavailable).')
+        header_lines.append(f'Recap for the {span_phrase} ({exchange_count} exchanges):')
+        recap_body = "\n".join(header_lines) + f"\n\n{ai_response.strip()}"
+
+        sections: list[str] = []
+        if display_thinking:
+            sanitized = display_thinking.strip()
+            if sanitized:
+                sections.append("Thought process (model reasoning):\n<<BEGIN THOUGHT>>\n" + sanitized + "\n<<END THOUGHT>>")
+        sections.append(recap_body.strip())
+        sections.append(f"Generated in {time_str}")
+        combined_message = "\n\n".join(section for section in sections if section)
+
+        await _send_recap_output(message, combined_message)
+
+        conversation_logger.info(
+            f"[{chat_label}] [User {username}({user_id})] recap ({timespan_label}) generated successfully."
+        )
+    except Exception as exc:
+        logger.error('Failed to generate recap: %s', str(exc))
+        conversation_logger.error(
+            f"[{chat_label}] [User {username}({user_id})] recap ({timespan_label}) generation failed: {str(exc)}"
+        )
+        try:
+            await status_message.edit_text('Failed to generate recap. Please try again later.')
+        except Exception:
+            pass
+
+
 @whitelist_required
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理按钮回调"""
@@ -495,6 +717,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             logger.warning(f"用户 {username}({user_id}) 尝试选择无效模型: {model_name}")
             await query.edit_message_text('无效的模型选择')
+
+    elif query.data.startswith('recap_'):
+        span_key = query.data[6:]
+        selection = resolve_recap_timespan(span_key)
+        if not selection:
+            logger.warning(f"User {username}({user_id}) selected invalid recap span: {span_key}")
+            await query.edit_message_text('Invalid recap range. Please try again.')
+            return
+
+        timespan_seconds, timespan_label = selection
+        await query.edit_message_text(f'Recap range selected: {timespan_label}')
+        await _execute_recap(context, query.message, user_id, username, timespan_seconds, timespan_label)
+        return
 
     elif query.data.startswith('persona_'):
         persona_name = query.data[8:]
@@ -658,6 +893,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         chat_label = "Chat unknown"
 
+    user_timestamp = time.time()
+    if update.message and update.message.date:
+        user_timestamp = update.message.date.timestamp()
+
+    sender_reference = None
+    if update.effective_user:
+        sender_reference = update.effective_user.username or update.effective_user.full_name
+
+    if STORAGE_AVAILABLE and chat_id is not None:
+        try:
+            await storage.save_user_message(
+                chat_id,
+                chat.type if chat and chat.type else "unknown",
+                user_timestamp,
+                user_id,
+                sender_reference,
+                user_message,
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist user message for chat %s: %s", chat_id, exc)
+
     is_group_chat = bool(chat and chat.type in {'group', 'supergroup'})
     speaker_name = update.effective_user.username or update.effective_user.full_name or "Unknown"
     speaker_label = f"@{speaker_name} ({user_id})"
@@ -689,10 +945,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if thinking_text:
             conversation_logger.info(f"[{chat_label}] [用户 {username}({user_id})] 第{conversation_round}轮 - AI思考: {thinking_text}")
 
+        response_timestamp = time.time()
+
         conversation_history.append({
             'user': user_entry_text,
-            'assistant': ai_response
+            'assistant': ai_response,
+            'timestamp': response_timestamp,
         })
+
+        if STORAGE_AVAILABLE and chat_id is not None:
+            try:
+                await storage.save_assistant_message(
+                    chat_id,
+                    chat.type if chat and chat.type else "unknown",
+                    response_timestamp,
+                    ai_response,
+                )
+            except Exception as exc:
+                logger.warning("Failed to persist assistant message for chat %s: %s", chat_id, exc)
 
         if len(conversation_history) > 20:
             del conversation_history[:-20]
@@ -729,7 +999,12 @@ def main() -> None:
         return
 
     # 创建应用
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(on_startup)
+        .build()
+    )
 
     # 添加错误处理器
     application.add_error_handler(error_handler)
@@ -741,6 +1016,7 @@ def main() -> None:
     application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("persona", persona_command))
     application.add_handler(CommandHandler("forget", forget_command))
+    application.add_handler(CommandHandler("recap", recap_command))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
