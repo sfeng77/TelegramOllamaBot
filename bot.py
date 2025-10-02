@@ -514,6 +514,12 @@ async def query_ollama(
         persona_label,
     )
 
+    logger.info(
+        "Full prompt:\n %s",
+        full_prompt,
+    )
+
+
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(
@@ -611,7 +617,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     is_group_chat = bool(chat and chat.type in {'group', 'supergroup'})
     speaker_name = update.effective_user.username or update.effective_user.full_name or "Unknown"
-    speaker_label = f"{speaker_name} ({user_id})"
+    speaker_label = f"@{speaker_name} ({user_id})"
     user_entry_text = f"{speaker_label}: {user_message}" if is_group_chat else user_message
 
     conversation_round = len(conversation_history) + 1
