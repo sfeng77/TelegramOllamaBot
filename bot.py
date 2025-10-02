@@ -19,6 +19,8 @@ from telegram.ext import (
     filters,
 )
 
+from backends import storage
+
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -49,6 +51,9 @@ conversation_logger.addHandler(conversation_handler)
 conversation_logger.setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
+
+STORAGE_AVAILABLE = False
+STORAGE_DB_PATH: str | None = None
 
 
 def split_long_message(text: str, max_length: int = 4000) -> list[str]:
@@ -190,6 +195,23 @@ async def send_ai_response(update: Update, ai_response: str, time_str: str, thin
     combined_message = "\n\n".join(section for section in sections if section)
     await send_long_message(update, combined_message)
 
+async def on_startup(application: Application) -> None:
+    """Initialise persistent storage when the bot starts."""
+    global STORAGE_AVAILABLE, STORAGE_DB_PATH
+
+    db_path = os.getenv('DB_PATH') or str(LOG_DIR / "conversations.db")
+
+    try:
+        await storage.init_db(db_path)
+    except Exception as exc:
+        STORAGE_AVAILABLE = False
+        STORAGE_DB_PATH = None
+        logger.error("Failed to initialise persistent storage at %s: %s", db_path, exc)
+    else:
+        STORAGE_AVAILABLE = True
+        STORAGE_DB_PATH = db_path
+        logger.info("Persistent history database initialised at %s", db_path)
+
 # Load environment variables
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -248,6 +270,27 @@ AVAILABLE_MODELS = {
 
 # 默认模型
 DEFAULT_MODEL = 'gpt-oss:20b'
+
+RECAP_RANGES: dict[str, tuple[int, str]] = {
+    "hour": (3600, "Last Hour"),
+    "day": (86400, "Last Day"),
+}
+
+RECAP_ALIAS_MAP: dict[str, str] = {
+    "1h": "hour",
+    "h": "hour",
+    "24h": "day",
+    "d": "day",
+    "last hour": "hour",
+    "last day": "day",
+}
+
+
+def resolve_recap_timespan(selection: str) -> tuple[int, str] | None:
+    """Normalize user input into a supported recap timespan definition."""
+    normalized = selection.lower().strip()
+    normalized = RECAP_ALIAS_MAP.get(normalized, normalized)
+    return RECAP_RANGES.get(normalized)
 
 async def _deny_access(update: Update) -> None:
     """Inform the user that access is restricted."""

@@ -4,3 +4,4 @@ model - 选择AI模型
 forget - 清除对话历史
 persona - 切换助手角色
 thoughts - 切换是否展示思考过程
+recap - Summarize conversation from the past hour or day
