@@ -71,7 +71,7 @@ With the virtual environment active and Ollama running:
 python bot.py
 ```
 
-Windows helpers are included: `start_ollama.bat` launches Ollama, `start_bot.bat` activates the virtual environment and starts the bot, and `setup_autostart.bat` plus `run_bot_hidden.vbs` provide background startup options.
+Windows helpers are included: `start_ollama.bat` launches Ollama and `start_bot.bat` activates the virtual environment before starting the bot.
 
 Keep `logs/` out of commits; it stores `bot.log`, `conversations.log`, and the optional SQLite database.
 

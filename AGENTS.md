@@ -1,7 +1,7 @@
-# Repository Guidelines
+﻿# Repository Guidelines
 
 ## Project Structure & Module Organization
-`bot.py` hosts the asynchronous Telegram <> Ollama workflow: command handlers (`/start`, `/model`, `/forget`), conversation memory, and API calls. Environment templates live in `.env.example`; copy to `.env` with `TELEGRAM_BOT_TOKEN`. Runtime artifacts go to `logs/` (rotating `bot.log` and `conversations.log`) and should stay out of commits. Windows helpers (`start_bot.bat`, `start_ollama.bat`, `setup_autostart.bat`, `run_bot_hidden.vbs`) wrap activation and startup; adjust them if paths change. `commands.txt` mirrors the command list you register with @BotFather. Keep experimental scripts inside a new `scripts/` subfolder if you add more automation.
+`bot.py` hosts the asynchronous Telegram <> Ollama workflow: command handlers (`/start`, `/model`, `/forget`), conversation memory, and API calls. Environment templates live in `.env.example`; copy to `.env` with `TELEGRAM_BOT_TOKEN`. Runtime artifacts go to `logs/` (rotating `bot.log` and `conversations.log`) and should stay out of commits. Windows helpers (`start_bot.bat`, `start_ollama.bat`) wrap activation and startup; adjust them if paths change. `commands.txt` mirrors the command list you register with @BotFather. Keep experimental scripts inside a new `scripts/` subfolder if you add more automation.
 
 ## Build, Test, and Development Commands
 Create or reuse the virtual env in `venv/`: `python -m venv venv` then `venv\Scripts\activate`. Install dependencies with `pip install -r requirements.txt`. Start Ollama locally and ensure the models listed in `AVAILABLE_MODELS` are pulled, e.g. `ollama pull gpt-oss:20b`. Run the bot via `python bot.py`; `start_bot.bat` chains Ollama startup, env activation, and the bot for Windows sessions. When tweaking commands, update `commands.txt` and re-upload the list to @BotFather.
