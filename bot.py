@@ -218,6 +218,21 @@ async def on_startup(application: Application) -> None:
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
+OLLAMA_WEB_SEARCH_URL = os.getenv('OLLAMA_WEB_SEARCH_URL', 'http://localhost:11434/api/web_search')
+OLLAMA_API_KEY = os.getenv('OLLAMA_API_KEY')
+
+raw_websearch_toggle = os.getenv('ENABLE_WEBSEARCH', '1').strip().lower()
+ENABLE_WEBSEARCH = raw_websearch_toggle not in {'0', 'false', 'no'}
+
+try:
+    WEBSEARCH_MAX_RESULTS = int(os.getenv('WEBSEARCH_MAX_RESULTS', '5') or '5')
+except ValueError:
+    logger.warning("Invalid WEBSEARCH_MAX_RESULTS value; defaulting to 5.")
+    WEBSEARCH_MAX_RESULTS = 5
+
+if WEBSEARCH_MAX_RESULTS < 1:
+    logger.warning("WEBSEARCH_MAX_RESULTS must be positive; defaulting to 1.")
+    WEBSEARCH_MAX_RESULTS = 1
 
 ALLOWED_USER_IDS_ENV = os.getenv('ALLOWED_TELEGRAM_USER_IDS', '')
 ALLOWED_USER_IDS: set[int] = set()
@@ -293,6 +308,151 @@ def resolve_recap_timespan(selection: str) -> tuple[int, str] | None:
     normalized = selection.lower().strip()
     normalized = RECAP_ALIAS_MAP.get(normalized, normalized)
     return RECAP_RANGES.get(normalized)
+
+
+async def refine_search_query(user_query: str, model: str) -> str:
+    """Use the model to produce a concise, search-optimized query string."""
+    instructions = (
+        "Rewrite the user-provided text into a concise web search query. "
+        "Keep key nouns and context, remove filler, limit to 120 characters. "
+        "Return only the refined query with no extra commentary."
+    )
+    prompt = f"{instructions}\n\nUser query:\n{user_query}\n\nRefined query:"
+    refined_text, _, _ = await query_ollama(
+        prompt=prompt,
+        model=model,
+        context_history=None,
+        persona_prompt="",
+        speaker_label=None,
+    )
+
+    candidate = (refined_text or "").strip()
+    if not candidate:
+        return user_query.strip()
+
+    first_line = candidate.splitlines()[0].strip()
+    cleaned = first_line.strip(" \"'")
+    if not cleaned:
+        return user_query.strip()
+
+    if len(cleaned) > 120:
+        cleaned = cleaned[:120].rstrip()
+    return cleaned
+
+
+def _normalize_search_results(raw_results: Any) -> list[dict[str, str]]:
+    """Convert Ollama web search output into a predictable list of dicts."""
+    if isinstance(raw_results, dict):
+        items = raw_results.get("results", [])
+    else:
+        items = raw_results
+
+    normalized: list[dict[str, str]] = []
+    if not isinstance(items, list):
+        return normalized
+
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        normalized.append(
+            {
+                "title": str(entry.get("title") or "").strip(),
+                "url": str(entry.get("url") or "").strip(),
+                "content": str(entry.get("content") or "").strip(),
+            }
+        )
+
+    return normalized
+
+
+async def perform_web_search(query: str, max_results: int) -> list[dict[str, str]]:
+    """Call Ollama web search REST API with optional Bearer auth."""
+    headers: dict[str, str] = {}
+    if OLLAMA_API_KEY:
+        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+
+    payload = {"query": query, "count": max_results}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(OLLAMA_WEB_SEARCH_URL, json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"Web search HTTP {resp.status}: {text}")
+                data: Any = await resp.json()
+    except Exception as exc:
+        raise RuntimeError(f"Web search request failed: {exc}") from exc
+
+    normalized = _normalize_search_results(data)
+    return normalized[:max_results]
+
+
+def build_websearch_report_prompt(refined_query: str, results: list[dict[str, str]]) -> str:
+    """Construct the summarisation prompt from search results."""
+
+    def clip_excerpt(text: str, limit: int = 600) -> str:
+        stripped = (text or "").strip()
+        if len(stripped) <= limit:
+            return stripped
+        return stripped[:limit].rstrip() + "..."
+
+    sources_lines: list[str] = []
+    for index, result in enumerate(results, start=1):
+        title = result.get("title", "").strip() or "(untitled)"
+        url = result.get("url", "").strip() or "(no url)"
+        excerpt = clip_excerpt(result.get("content", ""))
+        sources_lines.append(
+            f"[{index}] {title}\nURL: {url}\nExcerpt: {excerpt}\n"
+        )
+
+    sources_block = "\n".join(sources_lines).strip()
+
+    guidelines = (
+        "Task: Using ONLY the sources provided, write a brief factual Markdown report. "
+        "Include three sections: Summary (3-5 bullets), Key Findings (bullets with numbered citations like [1]), "
+        "and Sources (numbered list). Keep the overall length between 250 and 400 words. "
+        "Do not invent facts or URLs. If evidence is thin, note the limitation briefly."
+        "Use the language of the query."
+    )
+
+    format_hint = (
+        f"# Research Report: {refined_query}\n\n"
+        "## Summary\n"
+        "- ...\n"
+        "- ...\n\n"
+        "## Key Findings\n"
+        "- ... [1]\n"
+        "- ... [2]\n\n"
+        "## Sources\n"
+        "[1] Title — URL\n"
+        "[2] Title — URL\n"
+    )
+
+    prompt = (
+        f"{guidelines}\n\n"
+        f"Query: {refined_query}\n\n"
+        f"Sources:\n{sources_block}\n\n"
+        f"Follow this format:\n{format_hint}\n"
+        "Begin your answer now:"
+    )
+
+    return prompt
+
+
+async def summarize_search_results(
+    refined_query: str,
+    results: list[dict[str, str]],
+    model: str,
+    persona_prompt: str,
+) -> tuple[str, str | None, float]:
+    """Ask the model to produce a Markdown report from search results."""
+    prompt = build_websearch_report_prompt(refined_query, results)
+    return await query_ollama(
+        prompt=prompt,
+        model=model,
+        context_history=None,
+        persona_prompt=persona_prompt,
+        speaker_label=None,
+    )
 
 async def _deny_access(update: Update) -> None:
     """Inform the user that access is restricted."""
@@ -694,6 +854,165 @@ async def _execute_recap(
 
 
 @whitelist_required
+async def _process_websearch_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    raw_query: str,
+) -> None:
+    """Internal helper to perform the full web search workflow."""
+    message = update.message
+    if not message:
+        return
+
+    state = context.chat_data
+    state.pop('awaiting_websearch_query', None)
+
+    trimmed_query = raw_query.strip()
+    if not trimmed_query:
+        await message.reply_text("Please provide a non-empty query for web search.")
+        return
+
+    user = update.effective_user
+    username = (user.username or user.full_name or "Unknown") if user else "Unknown"
+    user_id = user.id if user else 0
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    chat_label = chat.title if chat and chat.title else (f"Chat {chat_id}" if chat_id else "Chat unknown")
+
+    if not state.get('model'):
+        state['model'] = DEFAULT_MODEL
+    state.setdefault('show_thoughts', False)
+
+    model_key = state.get('model', DEFAULT_MODEL)
+    model = AVAILABLE_MODELS.get(model_key, DEFAULT_MODEL)
+
+    persona_prompt = ''
+    if PERSONAS:
+        persona_name = state.get('persona', DEFAULT_PERSONA_KEY)
+        persona_prompt = PERSONAS.get(persona_name, '')
+
+    conversation_logger.info(
+        f"[{chat_label}] [User {username}({user_id})] /websearch requested: {trimmed_query}"
+    )
+
+    status_message = await message.reply_text("Refining query...")
+
+    try:
+        refined_query = await refine_search_query(trimmed_query, model)
+    except Exception as exc:
+        logger.error("Failed to refine websearch query: %s", exc)
+        await status_message.edit_text("Failed to refine the query. Please try again later.")
+        return
+
+    try:
+        await status_message.edit_text(f"Searching the web with query: {refined_query}")
+    except Exception:
+        pass
+
+    try:
+        search_results = await perform_web_search(refined_query, WEBSEARCH_MAX_RESULTS)
+    except Exception as exc:
+        logger.error("Web search execution failed: %s", exc)
+        await status_message.edit_text(str(exc))
+        return
+
+    if not search_results:
+        await status_message.edit_text("No web results were found for the refined query.")
+        return
+
+    try:
+        await status_message.edit_text("Generating report...")
+    except Exception:
+        pass
+
+    try:
+        report_text, thinking_text, elapsed = await summarize_search_results(
+            refined_query,
+            search_results,
+            model,
+            persona_prompt,
+        )
+    except Exception as exc:
+        logger.error("Failed to summarise web search results: %s", exc)
+        await status_message.edit_text("Failed to generate a summary. Please try again later.")
+        return
+
+    try:
+        await status_message.delete()
+    except Exception:
+        pass
+
+    generation_time = elapsed
+    if generation_time < 1:
+        time_str = f"{generation_time*1000:.0f}ms"
+    else:
+        time_str = f"{generation_time:.2f}s"
+
+    show_thoughts = state.get('show_thoughts', False)
+    display_thinking = thinking_text if show_thoughts else None
+
+    conversation_logger.info(
+        f"[{chat_label}] [User {username}({user_id})] /websearch refined='{refined_query}' results={len(search_results)}"
+    )
+    conversation_logger.info(
+        f"[{chat_label}] [User {username}({user_id})] /websearch report: {report_text}"
+    )
+    if display_thinking:
+        conversation_logger.info(
+            f"[{chat_label}] [User {username}({user_id})] /websearch thoughts: {display_thinking}"
+        )
+
+    if STORAGE_AVAILABLE and chat_id is not None:
+        timestamp_now = time.time()
+        try:
+            await storage.save_user_message(
+                chat_id,
+                chat.type if chat and chat.type else "unknown",
+                timestamp_now,
+                user_id,
+                username,
+                f"/websearch {trimmed_query}",
+            )
+            await storage.save_assistant_message(
+                chat_id,
+                chat.type if chat and chat.type else "unknown",
+                timestamp_now,
+                report_text,
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist websearch conversation for chat %s: %s", chat_id, exc)
+
+    await send_ai_response(update, report_text, time_str, display_thinking)
+
+
+@whitelist_required
+async def websearch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the /websearch command to perform an external lookup."""
+    if not update.message:
+        return
+
+    if not ENABLE_WEBSEARCH:
+        await update.message.reply_text(
+            "Web search is disabled. Set ENABLE_WEBSEARCH=1 in your environment to enable it."
+        )
+        return
+
+    parts = update.message.text.split(maxsplit=1)
+    state = context.chat_data
+    # If no query is provided, switch into prompt mode and wait for next user message.
+    if len(parts) < 2 or not parts[1].strip():
+        state['awaiting_websearch_query'] = True
+        keyboard = [[InlineKeyboardButton('Cancel', callback_data='websearch_cancel')]]
+        await update.message.reply_text(
+            "Please enter your web search query:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    await _process_websearch_request(update, context, parts[1])
+
+
+@whitelist_required
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理按钮回调"""
     query = update.callback_query
@@ -702,6 +1021,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     state = context.chat_data
 
     await query.answer()
+
+    if query.data == 'websearch_cancel':
+        state.pop('awaiting_websearch_query', None)
+        try:
+            await query.edit_message_text('Web search cancelled.')
+        except Exception:
+            pass
+        return
 
     if query.data.startswith('model_'):
         model_name = query.data[6:]  # 移除 'model_' 前缀
@@ -861,6 +1188,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     username = update.effective_user.username or "Unknown"
     state = context.chat_data
 
+    if state.get('awaiting_websearch_query'):
+        await _process_websearch_request(update, context, user_message)
+        return
+
     if not state.get('model'):
         state['model'] = DEFAULT_MODEL
 
@@ -1017,6 +1348,7 @@ def main() -> None:
     application.add_handler(CommandHandler("persona", persona_command))
     application.add_handler(CommandHandler("forget", forget_command))
     application.add_handler(CommandHandler("recap", recap_command))
+    application.add_handler(CommandHandler("websearch", websearch_command))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

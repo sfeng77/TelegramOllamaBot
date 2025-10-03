@@ -9,6 +9,7 @@ A Telegram assistant that proxies chat messages to a local Ollama instance. The 
 - Persona prompts loaded from `personas/*.txt` and selected per chat with `/persona`.
 - Per-chat conversation memory with optional SQLite persistence, `/forget` for quick resets, and `/recap` summaries for the last hour or day.
 - Optional display of model reasoning blocks between `<<BEGIN THOUGHT>>` and `<<END THOUGHT>>`, toggled via `/thoughts`.
+- Experimental `/websearch` command that refines a query, uses Ollama's web search results, and replies with a concise Markdown report.
 - Rotating operational and conversation logs written to `logs/bot.log` and `logs/conversations.log`.
 
 ## Prerequisites
@@ -49,6 +50,10 @@ A Telegram assistant that proxies chat messages to a local Ollama instance. The 
    - `ALLOWED_TELEGRAM_USER_IDS=<comma separated numeric IDs>` (the bot rejects everyone until this is populated)
    - Optional `DB_PATH` to control where the SQLite file lives (defaults to `logs/conversations.db`)
    - Optional `OLLAMA_API_URL` if Ollama is not on `http://localhost:11434/api/generate`
+   - Optional `ENABLE_WEBSEARCH=1` and `WEBSEARCH_MAX_RESULTS=5` to toggle and size the `/websearch` feature
+   - Optional `OLLAMA_API_KEY=<key>` if your Ollama web search requires authorization
+   - Optional `OLLAMA_WEB_SEARCH_URL=http://localhost:11434/api/web_search` to point at your web search endpoint
+   - Optional `ENABLE_WEBSEARCH=1` and `WEBSEARCH_MAX_RESULTS=5` to toggle and size the `/websearch` feature
 
 ### Prepare Ollama
 
@@ -86,6 +91,9 @@ Keep `commands.txt` in sync and re-upload it via @BotFather so the Telegram clie
 - `/thoughts [on|off]` — toggle whether reasoning blocks between `<<BEGIN THOUGHT>>` and `<<END THOUGHT>>` appear in replies.
 - `/forget` — clear the active chat history from memory (persisted transcripts remain available for recaps).
 - `/recap <hour|day>` — summarize recent messages saved in storage for the chosen window; omit the argument to get inline buttons.
+- `/websearch <query>` — refine the query, fetch top web results through Ollama, and return a brief Markdown research report (requires Ollama web search support).
+
+Note: Depending on your Ollama configuration (local vs. cloud/proxy), web search may require an API key. If so, set `OLLAMA_API_KEY` in your `.env`; the bot sends it as a Bearer token when calling the web search REST endpoint.
 
 Send regular text messages after `/start` to chat with the currently selected model and persona.
 
